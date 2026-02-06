@@ -7,6 +7,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { FfmpegCommand } from 'fluent-ffmpeg';
 import { logger } from './logger';
+
 import { MemoryStore, MemoryEvent, MemoryFact } from './memory';
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -19,21 +20,71 @@ interface TwitchChannelInfo {
   isLive: boolean;
 }
 
+// Русский Twitch-системный промт (живой чатер)
+const RU_SYSTEM_PROMPT = `
+Ты — обычный живой зритель Twitch, который сидит в чате и смотрит стрим.
+
+Твоя задача — писать сообщения так, как их пишет РЕАЛЬНЫЙ зритель Twitch:
+коротко, живо, иногда с иронией, иногда с эмоцией.
+
+ВАЖНО:
+- Ты НЕ бот и НИКОГДА не упоминаешь ИИ, модель или алгоритмы
+- Ты не пересказываешь слова стримера, а реагируешь на них
+- Ты пишешь как обычный человек из чата
+
+Стиль сообщений:
+- Короткие фразы (до 50 символов)
+- Разговорный русский язык
+- Допустим Twitch-сленг (харош, жесть, имба, ахах, чел)
+- Иногда можно использовать))) или ахах, но не всегда
+- Эмодзи использовать редко (примерно в 20% сообщений)
+
+Как себя вести:
+- Реагируй на действия, эмоции и шутки стримера
+- Комментируй происходящее в игре
+- Иногда задавай короткие вопросы по делу
+- Иногда просто выражай эмоцию
+
+Запрещено:
+- Повторы слов стримера
+- Канцелярит и длинные фразы
+- Капс и спам
+- Команды, спецсимволы, ссылки
+- Одинаковые сообщения подряд
+
+Генерируй ТОЛЬКО сообщение чата, без пояснений.
+`.trim();
+
 export class AIService extends EventEmitter {
   private isCapturing: boolean = false;
   private currentProcess: FfmpegCommand | null = null;
   private tempAudioFile: string | null = null;
   private accessToken: string | null = null;
   private _currentChannelInfo: TwitchChannelInfo | null = null;
+
   private messageInterval: number;
   private isProcessing: boolean = false;
   private lastProcessedTime: number = 0;
   private processingLock: boolean = false;
+
   private lastTranscriptionHash: string = '';
   private lastEmittedTranscription: string = '';
   private lastEmittedTime: number = 0;
+
   private yandexApiKey: string;
   private yandexFolderId: string;
+
+  // ===== Memory =====
+  private memoryStore = new MemoryStore();
+  private channelIdForMemory: string = '';
+  private facts: MemoryFact[] = [];
+  private lastFactsUpdateTs = 0;
+
+  // short-term timeline for chat realism (speech/chat/screen + bot replies)
+  private shortHistory: { role: 'user' | 'assistant'; text: string; ts: number }[] = [];
+  // queue of raw events for fact extraction
+  private shortEvents: MemoryEvent[] = [];
+
   private wavToLpcm(wav: Buffer): Buffer {
     // SpeechKit sync: format=lpcm expects raw PCM without WAV header
     if (wav.length < 12) return wav;
@@ -59,39 +110,13 @@ export class AIService extends EventEmitter {
 
     return wav;
   }
-  private memoryStore = new MemoryStore();
-  private channelIdForMemory: string = ''; // имя канала (логин)
-  private shortHistory: { role: 'user' | 'assistant'; text: string; ts: number }[] = [];
-  private shortEvents: MemoryEvent[] = []; // для пакетного обновления фактов
-  private facts: MemoryFact[] = [];
-  private lastFactsUpdateTs = 0;
-  private recordEvent(ev: MemoryEvent) {
-    this.shortEvents.push(ev);
-
-    // короткая история, которую будем подмешивать в messages
-    const prefix =
-      ev.type === 'speech' ? 'Стример: ' :
-        ev.type === 'chat' ? 'Чат: ' :
-          'Экран: ';
-
-    this.shortHistory.push({ role: 'user', text: `${prefix}${ev.text}`, ts: ev.ts });
-
-    // ограничиваем
-    if (this.shortHistory.length > 30) this.shortHistory = this.shortHistory.slice(-30);
-    if (this.shortEvents.length > 50) this.shortEvents = this.shortEvents.slice(-50);
-  }
-
-  public recordScreenContext(text: string, meta?: Record<string, any>) {
-    const t = (text || '').trim();
-    if (!t) return;
-    this.recordEvent({ ts: Date.now(), type: 'screen', text: t, meta });
-  }
-
 
   constructor() {
     super();
     logger.info('AIService initialized');
+
     this.messageInterval = parseInt(process.env.MESSAGE_INTERVAL || '5000');
+
     this.yandexApiKey = process.env.YANDEX_API_KEY || '';
     this.yandexFolderId = process.env.YANDEX_FOLDER_ID || '';
 
@@ -100,10 +125,12 @@ export class AIService extends EventEmitter {
     } else {
       logger.info('Yandex client configured');
     }
+
+    // Подхватываем входящий чат-контекст (его шлёт bot.ts)
     this.on('chatMessage', (payload: string) => {
       try {
         const ctx = JSON.parse(payload);
-        const user = ctx.username || 'зритель';
+        const user = (ctx.username || 'зритель').toString();
         const msg = (ctx.chatMessage || '').toString().trim();
         if (!msg) return;
 
@@ -113,9 +140,8 @@ export class AIService extends EventEmitter {
           text: `${user}: ${msg}`,
           meta: { user }
         });
-
       } catch (e) {
-        logger.error('Не удалось разобрать содержимое сообщения чата для извлечения данных из памяти:', e);
+        logger.error('Failed to parse chatMessage payload for memory:', e);
       }
     });
   }
@@ -126,6 +152,35 @@ export class AIService extends EventEmitter {
 
   private set currentChannelInfo(info: TwitchChannelInfo | null) {
     this._currentChannelInfo = info;
+  }
+
+  // ===== Screen context hook (later OCR / scene description) =====
+  public recordScreenContext(text: string, meta?: Record<string, any>) {
+    const t = (text || '').trim();
+    if (!t) return;
+    this.recordEvent({ ts: Date.now(), type: 'screen', text: t, meta });
+  }
+
+  private recordEvent(ev: MemoryEvent) {
+    this.shortEvents.push(ev);
+
+    const prefix =
+      ev.type === 'speech' ? 'Стример: ' :
+        ev.type === 'chat' ? 'Чат: ' :
+          'Экран: ';
+
+    this.shortHistory.push({ role: 'user', text: `${prefix}${ev.text}`, ts: ev.ts });
+
+    // caps
+    if (this.shortHistory.length > 30) this.shortHistory = this.shortHistory.slice(-30);
+    if (this.shortEvents.length > 50) this.shortEvents = this.shortEvents.slice(-50);
+  }
+
+  private pushAssistantTurn(text: string) {
+    const t = (text || '').trim();
+    if (!t) return;
+    this.shortHistory.push({ role: 'assistant', text: t, ts: Date.now() });
+    if (this.shortHistory.length > 30) this.shortHistory = this.shortHistory.slice(-30);
   }
 
   private async generateAccessToken(): Promise<string> {
@@ -157,7 +212,6 @@ export class AIService extends EventEmitter {
         this.accessToken = await this.generateAccessToken();
       }
 
-      // First, get the user ID from the channel name
       const userResponse = await axios.get(`https://api.twitch.tv/helix/users?login=${channelName}`, {
         headers: {
           'Client-ID': process.env.TWITCH_CLIENT_ID,
@@ -172,7 +226,6 @@ export class AIService extends EventEmitter {
       const userId = userResponse.data.data[0].id;
       logger.info('Found user ID:', userId);
 
-      // Now get the channel info using the user ID
       const channelResponse = await axios.get(`https://api.twitch.tv/helix/channels?broadcaster_id=${userId}`, {
         headers: {
           'Client-ID': process.env.TWITCH_CLIENT_ID,
@@ -182,7 +235,6 @@ export class AIService extends EventEmitter {
 
       const channelData = channelResponse.data.data[0];
 
-      // Get stream info to check if live and get current game
       const streamResponse = await axios.get(`https://api.twitch.tv/helix/streams?user_id=${userId}`, {
         headers: {
           'Client-ID': process.env.TWITCH_CLIENT_ID,
@@ -226,35 +278,32 @@ export class AIService extends EventEmitter {
   }
 
   public async startVoiceCapture(channel: string): Promise<void> {
-    if (this.isCapturing) {
-      return;
-    }
+    if (this.isCapturing) return;
 
     try {
-      // Extract channel name from URL if it's a full URL
       const channelName = channel.startsWith('https://www.twitch.tv/')
         ? channel.split('/').pop()
         : channel;
 
-      if (!channelName) {
-        throw new Error('Invalid channel name');
-      }
+      if (!channelName) throw new Error('Invalid channel name');
 
       logger.info('Starting voice capture for channel:', channelName);
-      this.channelIdForMemory = channelName;
-      const mem = await this.memoryStore.load(channelName);
-      this.facts = mem.facts || [];
-      logger.info(`Loaded ${this.facts.length} memory facts for channel ${channelName}`);
 
-      // Get channel info before starting capture
+      // Load channel info first
       this.currentChannelInfo = await this.getChannelInfo(channelName);
 
       if (!this.currentChannelInfo.isLive) {
         throw new Error(`Channel "${channelName}" is not currently live`);
       }
 
+      // Load long-term memory facts
+      this.channelIdForMemory = channelName;
+      const mem = await this.memoryStore.load(channelName);
+      this.facts = mem.facts || [];
+      logger.info(`Loaded ${this.facts.length} memory facts for channel ${channelName}`);
+
       this.isCapturing = true;
-      // Start the capture loop in the background
+
       this.captureLoop(channel).catch(error => {
         logger.error('Error in capture loop:', error);
         this.stopVoiceCapture();
@@ -316,7 +365,6 @@ export class AIService extends EventEmitter {
             .save(this.tempAudioFile!);
         });
 
-        // Add a small delay between captures to avoid processing the same audio twice
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (error) {
         isProcessing = false;
@@ -327,9 +375,7 @@ export class AIService extends EventEmitter {
   }
 
   public stopVoiceCapture(): void {
-    if (!this.isCapturing) {
-      return;
-    }
+    if (!this.isCapturing) return;
 
     if (this.currentProcess) {
       this.currentProcess.kill('SIGKILL');
@@ -337,9 +383,7 @@ export class AIService extends EventEmitter {
     }
 
     if (this.tempAudioFile) {
-      try {
-        unlinkSync(this.tempAudioFile);
-      } catch (error) { }
+      try { unlinkSync(this.tempAudioFile); } catch { }
       this.tempAudioFile = null;
     }
 
@@ -361,7 +405,6 @@ export class AIService extends EventEmitter {
     this.isProcessing = true;
 
     try {
-      // Check if file exists before trying to read it
       if (!existsSync(this.tempAudioFile)) {
         logger.warn('Temporary audio file not found:', this.tempAudioFile);
         return;
@@ -369,7 +412,6 @@ export class AIService extends EventEmitter {
 
       const audioData = await this.readAudioFile(this.tempAudioFile);
 
-      // Ensure we have valid audio data
       if (!Buffer.isBuffer(audioData) || audioData.length === 0) {
         logger.warn('Invalid or empty audio data received');
         return;
@@ -378,7 +420,6 @@ export class AIService extends EventEmitter {
       const transcribedText = await this.processAudioToText(audioData);
       const now = Date.now();
 
-      // Create a hash of the transcription to compare
       const currentHash = transcribedText ? transcribedText.trim() : '';
 
       logger.debug('Processing transcription:', {
@@ -388,31 +429,28 @@ export class AIService extends EventEmitter {
         messageInterval: this.messageInterval
       });
 
-      // Skip if we've processed this exact transcription recently
-      if (currentHash &&
-        (currentHash !== this.lastTranscriptionHash ||
-          now - this.lastProcessedTime >= this.messageInterval)) {
-
+      if (
+        currentHash &&
+        (currentHash !== this.lastTranscriptionHash || now - this.lastProcessedTime >= this.messageInterval)
+      ) {
         logger.info('Transcription received:', transcribedText);
-        this.recordEvent({
-          ts: Date.now(),
-          type: 'speech',
-          text: transcribedText,
-        });
-        await this.maybeUpdateFacts('новая речь стримера');
-
         this.lastTranscriptionHash = currentHash;
         this.lastProcessedTime = now;
 
-        // Only emit transcription event if it's different from the last one and enough time has passed
-        if (transcribedText !== this.lastEmittedTranscription &&
-          now - this.lastEmittedTime >= this.messageInterval) {
+        if (
+          transcribedText !== this.lastEmittedTranscription &&
+          now - this.lastEmittedTime >= this.messageInterval
+        ) {
           logger.info('Emitting transcription event');
           this.emit('transcription', transcribedText);
+
           this.lastEmittedTranscription = transcribedText;
           this.lastEmittedTime = now;
 
-          // Generate and emit message
+          // memory: streamer speech event
+          this.recordEvent({ ts: Date.now(), type: 'speech', text: transcribedText });
+          await this.maybeUpdateFacts('новая речь стримера');
+
           const message = await this.generateMessage(JSON.stringify({
             lastTranscription: transcribedText,
             isStreamerMessage: true
@@ -421,6 +459,9 @@ export class AIService extends EventEmitter {
           if (message && message.trim() !== '') {
             logger.info('Generated message:', message);
             this.emit('message', message);
+
+            // memory: remember what bot said
+            this.pushAssistantTurn(message);
           }
         }
 
@@ -431,11 +472,8 @@ export class AIService extends EventEmitter {
     } catch (error) {
       logger.error('Error processing audio chunk:', error);
     } finally {
-      // Always clean up the temporary file
       try {
-        if (this.tempAudioFile && existsSync(this.tempAudioFile)) {
-          unlinkSync(this.tempAudioFile);
-        }
+        if (this.tempAudioFile && existsSync(this.tempAudioFile)) unlinkSync(this.tempAudioFile);
       } catch (error) {
         logger.error('Error cleaning up temporary file:', error);
       }
@@ -449,11 +487,8 @@ export class AIService extends EventEmitter {
     return new Promise((resolve, reject) => {
       const fs = require('fs');
       fs.readFile(filePath, (err: Error | null, data: Buffer) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(data);
-        }
+        if (err) reject(err);
+        else resolve(data);
       });
     });
   }
@@ -462,14 +497,9 @@ export class AIService extends EventEmitter {
     try {
       const lang = process.env.YANDEX_STT_LANG || (process.env.ORIGINAL_STREAM_LANGUAGE === 'ru' ? 'ru-RU' : 'en-US');
 
-      if (!this.yandexApiKey) {
-        throw new Error('YANDEX_API_KEY is missing');
-      }
-      if (!this.yandexFolderId) {
-        throw new Error('YANDEX_FOLDER_ID is missing');
-      }
+      if (!this.yandexApiKey) throw new Error('YANDEX_API_KEY is missing');
+      if (!this.yandexFolderId) throw new Error('YANDEX_FOLDER_ID is missing');
 
-      // Your ffmpeg outputs WAV (with header). SpeechKit sync wants LPCM without WAV header when format=lpcm
       const lpcm = this.wavToLpcm(audioData);
 
       const url = 'https://stt.api.cloud.yandex.net/speech/v1/stt:recognize';
@@ -496,9 +526,58 @@ export class AIService extends EventEmitter {
     }
   }
 
+  private buildUserPrompt(parsedContext: any): string {
+    const channelContext = `
+Название стрима: ${this.currentChannelInfo?.title}
+Игра: ${this.currentChannelInfo?.gameName}
+Зрителей: ${this.currentChannelInfo?.viewerCount}
+Описание канала: ${this.currentChannelInfo?.description}
+Язык стрима: русский
+`.trim();
+
+    const lastTranscription = parsedContext.lastTranscription
+      ? `Стример только что сказал: "${parsedContext.lastTranscription}"`
+      : '';
+
+    const chatContext = parsedContext.chatMessage
+      ? `Сообщение в чате: "${parsedContext.chatMessage}"`
+      : '';
+
+    const timeContext = parsedContext.timeSinceLastMessage
+      ? `Время с последнего сообщения: ${Math.floor(parsedContext.timeSinceLastMessage / 1000)} сек`
+      : '';
+
+    const messageCountContext = parsedContext.messageCount
+      ? `Сколько сообщений бот уже отправил: ${parsedContext.messageCount}`
+      : '';
+
+    return `
+Ты смотришь стрим на Twitch как обычный зритель.
+
+Контекст:
+${channelContext}
+
+${lastTranscription}
+${chatContext}
+${timeContext}
+${messageCountContext}
+
+Задача:
+Напиши ОДНО короткое сообщение в чат как обычный зритель Twitch.
+
+Правила:
+- До 50 символов
+- Разговорный русский язык
+- Без пересказа слов стримера (реагируй, а не цитируй)
+- Можно использовать Twitch-сленг (харош, жесть, имба, ахах, чел)
+- Эмодзи редко (примерно в 20% сообщений)
+- Без ссылок, команд, спецсимволов
+- Верни ТОЛЬКО текст сообщения чата, без пояснений
+`.trim();
+  }
+
   public async generateMessage(context?: string): Promise<string> {
     try {
-      // If no channel info is available yet, don't generate a message
       if (!this.currentChannelInfo) {
         logger.warn('No channel info available for message generation');
         return '';
@@ -506,158 +585,83 @@ export class AIService extends EventEmitter {
 
       let parsedContext: any = {};
       try {
-        if (context) {
-          parsedContext = JSON.parse(context);
-        }
+        if (context) parsedContext = JSON.parse(context);
       } catch (error) {
         logger.error('Error parsing context:', error);
         parsedContext = { rawText: context };
       }
 
-      // Don't generate messages without transcription context
+      // Не генерим если совсем нет повода
       if (!parsedContext.lastTranscription && !parsedContext.chatMessage) {
-        logger.info('Transcription is being generated and will be available soon');
+        logger.info('No transcription/chat context yet');
         return '';
       }
 
-      // Don't generate messages if the transcription is too short
-      if (parsedContext.lastTranscription && parsedContext.lastTranscription.length < 10) {
+      // Если есть только речь и она слишком короткая — пропускаем
+      if (parsedContext.lastTranscription && !parsedContext.chatMessage && parsedContext.lastTranscription.length < 10) {
         logger.warn('Transcription too short for message generation');
         return '';
       }
 
-      const channelContext = `
-        Channel Title: ${this.currentChannelInfo.title}
-        Game: ${this.currentChannelInfo.gameName}
-        Viewers: ${this.currentChannelInfo.viewerCount}
-        Description: ${this.currentChannelInfo.description}
-        Language: ${process.env.ORIGINAL_STREAM_LANGUAGE || 'en'}
-      `;
+      // Если пришёл chatMessage (из bot.ts), кладём его в память + иногда обновляем факты
+      if (parsedContext.chatMessage) {
+        this.recordEvent({
+          ts: Date.now(),
+          type: 'chat',
+          text: parsedContext.chatMessage.toString().trim()
+        });
+        await this.maybeUpdateFacts('новое сообщение в чате');
+      }
 
-      const lastTranscription = parsedContext.lastTranscription ? `
-        The streamer just said: "${parsedContext.lastTranscription}"
-      ` : '';
+      const prompt = this.buildUserPrompt(parsedContext);
 
-      const chatContext = parsedContext.chatMessage ? `
-        A viewer just said: "${parsedContext.chatMessage}"
-      ` : '';
-
-      const timeContext = parsedContext.timeSinceLastMessage ? `
-        Time since last message: ${Math.floor(parsedContext.timeSinceLastMessage / 1000)} seconds
-      ` : '';
-
-      const messageCountContext = parsedContext.messageCount ? `
-        Total messages sent: ${parsedContext.messageCount}
-      ` : '';
       const queryText =
         (parsedContext.lastTranscription || '') + ' ' +
-        (parsedContext.chatMessage || '');
+        (parsedContext.chatMessage || '') + ' ' +
+        (this.currentChannelInfo.gameName || '');
 
       const relevantFacts = this.memoryStore.pickRelevantFacts(this.facts || [], queryText, 8);
 
       const factsBlock = relevantFacts.length
-        ? `Память (важные факты о стриме/чате):\n- ${relevantFacts.map(f => f.text).join('\n- ')}\n`
-        : `Память: пока нет важных фактов.\n`;
-
-      const historyBlock = this.shortHistory.length
-        ? `Последние события:\n${this.shortHistory.slice(-12).map(h => `- ${h.text}`).join('\n')}\n`
+        ? `Память (важные факты о стриме/чате):\n- ${relevantFacts.map(f => f.text).join('\n- ')}`
         : '';
-
-      const prompt = `
-        Ты смотришь стрим на Twitch как обычный зритель.
-
-        Контекст стрима:
-        Название стрима: ${this.currentChannelInfo.title}
-        Игра: ${this.currentChannelInfo.gameName}
-        Зрителей: ${this.currentChannelInfo.viewerCount}
-        Описание канала: ${this.currentChannelInfo.description}
-        Язык стрима: русский
-
-        ${lastTranscription ? `Стример только что сказал: "${parsedContext.lastTranscription}"` : ''}
-        ${chatContext ? `Сообщение в чате: "${parsedContext.chatMessage}"` : ''}
-
-        Твоя задача:
-        Написать одно короткое сообщение в чат, как обычный зритель Twitch.
-
-        Правила:
-        - Сообщение до 50 символов
-        - Разговорный русский язык
-        - Без пересказа слов стримера
-        - Реагируй эмоцией, шуткой или коротким комментом
-        - Можно использовать Twitch-сленг (харош, жесть, имба, ахах)
-        - Эмодзи использовать редко
-        - Сообщение должно выглядеть живым и случайным
-
-        Типы сообщений (выбирай по ситуации):
-        - Реакция на происходящее в игре
-        - Реакция на эмоции стримера
-        - Короткий вопрос по игре
-        - Ироничный или поддерживающий комментарий
-
-        Если контекста мало — напиши нейтральную реакцию зрителя.
-
-        ВАЖНО:
-        - Верни ТОЛЬКО текст сообщения чата
-        - Без пояснений
-      `;
 
       logger.info('Generating message with context:', {
         channel: this.currentChannelInfo.title,
         game: this.currentChannelInfo.gameName,
         transcription: parsedContext.lastTranscription,
-        isStreamerMessage: parsedContext.isStreamerMessage
+        chatMessage: parsedContext.chatMessage
       });
-
 
       const url = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
       const modelName = process.env.YANDEX_GPT_MODEL || 'yandexgpt-lite';
       const modelUri = `gpt://${this.yandexFolderId}/${modelName}`;
+
+      const messages: { role: 'system' | 'user' | 'assistant'; text: string }[] = [
+        { role: 'system', text: RU_SYSTEM_PROMPT },
+      ];
+
+      if (factsBlock) {
+        messages.push({ role: 'system', text: factsBlock });
+      }
+
+      // short-term history (последние события: речь/чат/экран и ответы бота)
+      const recentTurns = this.shortHistory.slice(-12).map(t => ({
+        role: t.role,
+        text: t.text
+      }));
+      messages.push(...recentTurns);
+
+      messages.push({ role: 'user', text: prompt });
 
       const body = {
         modelUri,
         completionOptions: {
           stream: false,
           temperature: 0.7,
-          maxTokens: 50
+          maxTokens: 80
         },
-        messages: [
-          {
-            role: 'system', text: `
-            Ты — обычный живой зритель Twitch, который сидит в чате и смотрит стрим.
-
-            Твоя задача — писать сообщения так, как их пишет РЕАЛЬНЫЙ зритель Twitch:
-            коротко, живо, иногда с иронией, иногда с эмоцией.
-
-            ВАЖНО:
-            - Ты НЕ бот и НИКОГДА не упоминаешь ИИ, модель или алгоритмы
-            - Ты не пересказываешь слова стримера, а реагируешь на них
-            - Ты пишешь как обычный человек из чата
-
-            Стиль сообщений:
-            - Короткие фразы (до 50 символов)
-            - Разговорный русский язык
-            - Допустим сленг Twitch и стримерский стиль
-            - Иногда можно использовать))) или ахах, но не всегда
-            - Эмодзи использовать редко (примерно в 20% сообщений)
-
-            Как себя вести:
-            - Реагируй на действия, эмоции и шутки стримера
-            - Комментируй происходящее в игре
-            - Иногда задавай короткие вопросы по делу
-            - Иногда просто выражай эмоцию
-
-            Запрещено:
-            - Повторы слов стримера
-            - Канцелярит и длинные фразы
-            - Капс и спам
-            - Команды, спецсимволы, ссылки
-            - Одинаковые сообщения подряд
-
-            Ты должен выглядеть как обычный зритель, который давно сидит на Twitch.
-            Генерируй ТОЛЬКО сообщение чата, без пояснений.
-            ` },
-          { role: 'user', text: prompt }
-        ]
+        messages
       };
 
       const r = await axios.post(url, body, {
@@ -675,8 +679,8 @@ export class AIService extends EventEmitter {
       return '';
     }
   }
+
   private async maybeUpdateFacts(triggerHint: string) {
-    // раз в ~2 минуты или когда набралось много событий
     const now = Date.now();
     const should =
       (now - this.lastFactsUpdateTs > 120_000 && this.shortEvents.length >= 6) ||
@@ -685,14 +689,13 @@ export class AIService extends EventEmitter {
     if (!should) return;
     if (!this.channelIdForMemory) return;
 
-    const events = this.shortEvents.splice(0); // забрали и очистили пачку
+    const events = this.shortEvents.splice(0);
     this.lastFactsUpdateTs = now;
 
     const modelName = process.env.YANDEX_GPT_MODEL || 'yandexgpt-lite';
     const modelUri = `gpt://${this.yandexFolderId}/${modelName}`;
     const url = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
 
-    // Сжимаем события (чтобы токены не улетели)
     const eventsText = events
       .slice(-20)
       .map(e => {
@@ -701,38 +704,41 @@ export class AIService extends EventEmitter {
       })
       .join('\n');
 
-    const existing = (this.facts || []).slice(-40).map(f => `- (${f.importance}) ${f.text}`).join('\n');
+    const existing = (this.facts || [])
+      .slice(-40)
+      .map(f => `- (${f.importance}) ${f.text}`)
+      .join('\n');
 
     const system = `
-  Ты — модуль памяти для Twitch-стрима.
-  Твоя задача: из новых событий извлечь КОРОТКИЕ факты, которые пригодятся для будущих реплик в чате.
-  Факт — это краткое утверждение на русском (1 строка), без домыслов и без “кажется”.
-  Если факт не подтверждён — не добавляй.
-  Учитывай контекст Twitch: шутки, прозвища, любимые темы, повторяющиеся ситуации, правила чата.
+Ты — модуль памяти для Twitch-стрима.
+Твоя задача: из новых событий извлечь КОРОТКИЕ факты, которые пригодятся для будущих реплик в чате.
+Факт — это краткое утверждение на русском (1 строка), без домыслов и без “кажется”.
+Если факт не подтверждён — не добавляй.
+Учитывай контекст Twitch: шутки, прозвища, любимые темы, повторяющиеся ситуации, правила чата.
 
-  Выход СТРОГО в JSON без markdown:
-  {
-    "facts": [
-      {"text":"...", "importance":1-5, "tags":["...","..."]},
-      ...
-    ]
-  }
+Выход СТРОГО в JSON без markdown:
+{
+  "facts": [
+    {"text":"...", "importance":1-5, "tags":["...","..."]},
+    ...
+  ]
+}
 
-  Ограничения:
-  - максимум 8 новых фактов за раз
-  - каждый факт до 120 символов
-  - не дублируй существующие факты по смыслу
-  `;
+Ограничения:
+- максимум 8 новых фактов за раз
+- каждый факт до 120 символов
+- не дублируй существующие факты по смыслу
+`.trim();
 
     const user = `
-  СУЩЕСТВУЮЩИЕ ФАКТЫ:
-  ${existing || '(пока нет)'}
+СУЩЕСТВУЮЩИЕ ФАКТЫ:
+${existing || '(пока нет)'}
 
-  НОВЫЕ СОБЫТИЯ:
-  ${eventsText}
+НОВЫЕ СОБЫТИЯ:
+${eventsText}
 
-  Подсказка-триггер (не факт): ${triggerHint}
-  `;
+Подсказка-триггер (не факт): ${triggerHint}
+`.trim();
 
     const body = {
       modelUri,
@@ -753,7 +759,6 @@ export class AIService extends EventEmitter {
       const newFacts = Array.isArray(parsed?.facts) ? parsed.facts : [];
 
       const dedup = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim();
-
       const existingSet = new Set((this.facts || []).map(f => dedup(f.text)));
 
       for (const nf of newFacts) {
@@ -773,12 +778,16 @@ export class AIService extends EventEmitter {
         existingSet.add(key);
       }
 
-      // ограничим память по размеру
+      // ограничим память
       this.facts = this.facts
         .sort((a, b) => (b.importance - a.importance) || (b.ts - a.ts))
         .slice(0, 80);
 
-      await this.memoryStore.save({ channel: this.channelIdForMemory, updatedAt: Date.now(), facts: this.facts });
+      await this.memoryStore.save({
+        channel: this.channelIdForMemory,
+        updatedAt: Date.now(),
+        facts: this.facts
+      });
 
       logger.info(`Memory updated: now ${this.facts.length} facts stored`);
     } catch (e) {
@@ -786,10 +795,8 @@ export class AIService extends EventEmitter {
     }
   }
 
-
   private async getStreamUrl(channel: string): Promise<string> {
     try {
-      // Extract channel name from URL if it's a full URL
       const channelName = channel.startsWith('https://www.twitch.tv/')
         ? channel.split('/').pop()
         : channel;
@@ -798,12 +805,10 @@ export class AIService extends EventEmitter {
         throw new Error('Invalid channel name');
       }
 
-      // Generate new access token if not available
       if (!this.accessToken) {
         this.accessToken = await this.generateAccessToken();
       }
 
-      // First, check if the channel exists
       const userResponse = await axios.get(`https://api.twitch.tv/helix/users?login=${channelName}`, {
         headers: {
           'Client-ID': process.env.TWITCH_CLIENT_ID,
@@ -817,7 +822,6 @@ export class AIService extends EventEmitter {
 
       const userId = userResponse.data.data[0].id;
 
-      // Then check if the stream is live and get stream info
       const streamResponse = await axios.get(`https://api.twitch.tv/helix/streams?user_id=${userId}`, {
         headers: {
           'Client-ID': process.env.TWITCH_CLIENT_ID,
@@ -829,7 +833,6 @@ export class AIService extends EventEmitter {
         throw new Error(`Channel "${channelName}" is not currently live`);
       }
 
-      // Get the stream access token and signature using the new endpoint
       const tokenResponse = await axios.post(`https://gql.twitch.tv/gql`, {
         operationName: "PlaybackAccessToken",
         variables: {
@@ -863,12 +866,10 @@ export class AIService extends EventEmitter {
         throw new Error('Invalid token or signature received');
       }
 
-      // Get the stream URL from the stream info
       return `https://usher.ttvnw.net/api/channel/hls/${channelName}.m3u8?client_id=kimne78kx3ncx6brgo4mv6wki5h1ko&token=${encodeURIComponent(token)}&sig=${signature}`;
     } catch (error) {
       if (axios.isAxiosError(error)) {
         if (error.response?.status === 401) {
-          // Try to generate a new token and retry
           this.accessToken = await this.generateAccessToken();
           return this.getStreamUrl(channel);
         } else if (error.response?.status === 404) {
@@ -882,4 +883,4 @@ export class AIService extends EventEmitter {
       throw error;
     }
   }
-} 
+}

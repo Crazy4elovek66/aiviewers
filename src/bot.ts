@@ -81,7 +81,7 @@ export class Bot {
         };
 
         // Occasionally respond to other messages
-        if (Math.random() < 0.2) {
+        if (Math.random() < 0.1) {
           this.aiService.emit('chatMessage', JSON.stringify(context));
         }
       } catch (error) {
