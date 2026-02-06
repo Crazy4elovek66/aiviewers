@@ -341,7 +341,8 @@ export class AIService extends EventEmitter {
               '-acodec', 'pcm_s16le',
               '-ac', '1',
               '-ar', '16000',
-              '-vn'
+              '-vn', '-map', '0:a:0'
+
             ])
             .duration(parseInt(process.env.TRANSCRIPT_DURATION || '60000') / 1000)
             .on('error', (err: Error) => {
@@ -418,6 +419,9 @@ export class AIService extends EventEmitter {
       }
 
       const transcribedText = await this.processAudioToText(audioData);
+      logger.info('Audio bytes:', audioData.length);
+      logger.info('STT raw:', JSON.stringify(transcribedText));
+
       const now = Date.now();
 
       const currentHash = transcribedText ? transcribedText.trim() : '';
@@ -467,6 +471,7 @@ export class AIService extends EventEmitter {
 
         logger.info('Processing complete');
       } else {
+        logger.info('STT raw:', JSON.stringify(transcribedText));
         logger.info('Skipping duplicate transcription');
       }
     } catch (error) {
@@ -481,6 +486,7 @@ export class AIService extends EventEmitter {
       this.isProcessing = false;
       this.processingLock = false;
     }
+
   }
 
   private readAudioFile(filePath: string): Promise<Buffer> {

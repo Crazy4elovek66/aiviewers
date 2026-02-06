@@ -81,7 +81,7 @@ export class Bot {
         };
 
         // Occasionally respond to other messages
-        if (Math.random() < 0.1) {
+        if (Math.random() < 1.0) {
           this.aiService.emit('chatMessage', JSON.stringify(context));
         }
       } catch (error) {
@@ -130,7 +130,7 @@ export class Bot {
 
   private async setupVoiceCapture(channel: string): Promise<void> {
     logger.info(`Setting up voice capture for channel: ${channel}`);
-
+    if (this.aiService.isVoiceCaptureActive) return;
     try {
       // Start voice capture first, which will fetch channel info
       await this.aiService.startVoiceCapture(channel);

@@ -24,16 +24,22 @@ export class Logger {
 
   private formatMessage(level: LogLevel, message: string, ...args: any[]): string {
     const timestamp = new Date().toISOString();
-    const formattedArgs = args.map(arg => 
-      typeof arg === 'object' ? JSON.stringify(arg, null, 2) : arg
-    ).join(' ');
+    const formattedArgs = args.map(arg => {
+      if (arg instanceof Error) {
+        return `${arg.message}\n${arg.stack || ''}`;
+      }
+      if (typeof arg === 'object') {
+        try { return JSON.stringify(arg, null, 2); } catch { return String(arg); }
+      }
+      return String(arg);
+    }).join(' ');
 
     return `[${timestamp}] [${level}] ${message} ${formattedArgs}`;
   }
 
   private log(level: LogLevel, message: string, ...args: any[]) {
     const formattedMessage = this.formatMessage(level, message, ...args);
-    
+
     switch (level) {
       case LogLevel.DEBUG:
         if (this.isDebug) {
