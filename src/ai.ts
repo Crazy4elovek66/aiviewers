@@ -7,6 +7,8 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { FfmpegCommand } from 'fluent-ffmpeg';
 import { logger } from './logger';
+import { analyzePcm16le } from "./audioDebug";
+
 
 import { MemoryStore, MemoryEvent, MemoryFact } from './memory';
 
@@ -420,6 +422,9 @@ export class AIService extends EventEmitter {
 
       const transcribedText = await this.processAudioToText(audioData);
       logger.info('Audio bytes:', audioData.length);
+      const stats = analyzePcm16le(audioData);
+      logger.info(`PCM stats: samples=${stats.samples} rms=${stats.rms.toFixed(6)} peak=${stats.peak.toFixed(6)}`);
+
       logger.info('STT raw:', JSON.stringify(transcribedText));
 
       const now = Date.now();
