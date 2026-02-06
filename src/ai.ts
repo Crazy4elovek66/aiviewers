@@ -7,6 +7,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { FfmpegCommand } from 'fluent-ffmpeg';
 import { logger } from './logger';
+import { MemoryStore, MemoryEvent, MemoryFact } from './memory';
 
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -58,6 +59,33 @@ export class AIService extends EventEmitter {
 
     return wav;
   }
+  private memoryStore = new MemoryStore();
+  private channelIdForMemory: string = ''; // имя канала (логин)
+  private shortHistory: { role: 'user' | 'assistant'; text: string; ts: number }[] = [];
+  private shortEvents: MemoryEvent[] = []; // для пакетного обновления фактов
+  private facts: MemoryFact[] = [];
+  private lastFactsUpdateTs = 0;
+  private recordEvent(ev: MemoryEvent) {
+    this.shortEvents.push(ev);
+
+    // короткая история, которую будем подмешивать в messages
+    const prefix =
+      ev.type === 'speech' ? 'Стример: ' :
+        ev.type === 'chat' ? 'Чат: ' :
+          'Экран: ';
+
+    this.shortHistory.push({ role: 'user', text: `${prefix}${ev.text}`, ts: ev.ts });
+
+    // ограничиваем
+    if (this.shortHistory.length > 30) this.shortHistory = this.shortHistory.slice(-30);
+    if (this.shortEvents.length > 50) this.shortEvents = this.shortEvents.slice(-50);
+  }
+
+  public recordScreenContext(text: string, meta?: Record<string, any>) {
+    const t = (text || '').trim();
+    if (!t) return;
+    this.recordEvent({ ts: Date.now(), type: 'screen', text: t, meta });
+  }
 
 
   constructor() {
@@ -72,7 +100,24 @@ export class AIService extends EventEmitter {
     } else {
       logger.info('Yandex client configured');
     }
+    this.on('chatMessage', (payload: string) => {
+      try {
+        const ctx = JSON.parse(payload);
+        const user = ctx.username || 'зритель';
+        const msg = (ctx.chatMessage || '').toString().trim();
+        if (!msg) return;
 
+        this.recordEvent({
+          ts: Date.now(),
+          type: 'chat',
+          text: `${user}: ${msg}`,
+          meta: { user }
+        });
+
+      } catch (e) {
+        logger.error('Не удалось разобрать содержимое сообщения чата для извлечения данных из памяти:', e);
+      }
+    });
   }
 
   public get currentChannelInfo(): TwitchChannelInfo | null {
@@ -196,6 +241,10 @@ export class AIService extends EventEmitter {
       }
 
       logger.info('Starting voice capture for channel:', channelName);
+      this.channelIdForMemory = channelName;
+      const mem = await this.memoryStore.load(channelName);
+      this.facts = mem.facts || [];
+      logger.info(`Loaded ${this.facts.length} memory facts for channel ${channelName}`);
 
       // Get channel info before starting capture
       this.currentChannelInfo = await this.getChannelInfo(channelName);
@@ -345,6 +394,13 @@ export class AIService extends EventEmitter {
           now - this.lastProcessedTime >= this.messageInterval)) {
 
         logger.info('Transcription received:', transcribedText);
+        this.recordEvent({
+          ts: Date.now(),
+          type: 'speech',
+          text: transcribedText,
+        });
+        await this.maybeUpdateFacts('новая речь стримера');
+
         this.lastTranscriptionHash = currentHash;
         this.lastProcessedTime = now;
 
@@ -493,60 +549,56 @@ export class AIService extends EventEmitter {
       const messageCountContext = parsedContext.messageCount ? `
         Total messages sent: ${parsedContext.messageCount}
       ` : '';
+      const queryText =
+        (parsedContext.lastTranscription || '') + ' ' +
+        (parsedContext.chatMessage || '');
+
+      const relevantFacts = this.memoryStore.pickRelevantFacts(this.facts || [], queryText, 8);
+
+      const factsBlock = relevantFacts.length
+        ? `Память (важные факты о стриме/чате):\n- ${relevantFacts.map(f => f.text).join('\n- ')}\n`
+        : `Память: пока нет важных фактов.\n`;
+
+      const historyBlock = this.shortHistory.length
+        ? `Последние события:\n${this.shortHistory.slice(-12).map(h => `- ${h.text}`).join('\n')}\n`
+        : '';
 
       const prompt = `
-        You are a Twitch viewer watching this stream. Generate a natural, engaging message that a real viewer would type in chat.
-        
-        Stream Context:
-        ${channelContext}
-        
-        ${lastTranscription}
-        ${chatContext}
-        ${timeContext}
-        ${messageCountContext}
-        
-        Guidelines:
-        - Write as if you're a real viewer enjoying the stream
-        - Keep messages short and casual (max 50 characters)
-        - Use emojis in only 20% of messages, and when used, keep them natural and relevant
-        - Focus on the current game being played (${this.currentChannelInfo.gameName})
-        - If there's a transcription available, respond naturally to what the streamer said
-        - If there's a chat message, respond to it naturally
-        - Write in the stream's language (${process.env.ORIGINAL_STREAM_LANGUAGE || 'en'})
-        - Don't mention that you're a bot or AI
-        - Don't use excessive emojis or caps
-        - Don't spam or use repetitive messages
-        - Don't use commands or special characters
-        - Keep it natural and conversational
-        - Consider the time since the last message and message count to vary your responses
-        - IMPORTANT: Do NOT repeat what the streamer said. Instead, respond naturally to it.
-        - IMPORTANT: Generate JUST the chat message, not any other text or comments.
-        
-        Message Types (choose based on context):
-        1. Game-related comments:
-           - Comment on gameplay moments
-           - Ask about game mechanics
-           - Share tips or strategies
-           - React to in-game events
-        
-        2. Stream interaction:
-           - Respond to streamer's commentary
-           - Ask relevant questions about the game
-           - Share your thoughts on the streamer's playstyle
-           - React to streamer's reactions
-        
-        3. General engagement:
-           - Welcome new viewers
-           - React to streamer's jokes or stories
-           - Share your excitement about the stream
-           - Ask about streamer's plans or goals
-        
-        If there's not enough context to generate a specific message, ask general questions about:
-        - The current game being played
-        - The streamer's experience with the game
-        - Favorite strategies or playstyles
-        - Upcoming content or plans
-        - Community events or tournaments
+        Ты смотришь стрим на Twitch как обычный зритель.
+
+        Контекст стрима:
+        Название стрима: ${this.currentChannelInfo.title}
+        Игра: ${this.currentChannelInfo.gameName}
+        Зрителей: ${this.currentChannelInfo.viewerCount}
+        Описание канала: ${this.currentChannelInfo.description}
+        Язык стрима: русский
+
+        ${lastTranscription ? `Стример только что сказал: "${parsedContext.lastTranscription}"` : ''}
+        ${chatContext ? `Сообщение в чате: "${parsedContext.chatMessage}"` : ''}
+
+        Твоя задача:
+        Написать одно короткое сообщение в чат, как обычный зритель Twitch.
+
+        Правила:
+        - Сообщение до 50 символов
+        - Разговорный русский язык
+        - Без пересказа слов стримера
+        - Реагируй эмоцией, шуткой или коротким комментом
+        - Можно использовать Twitch-сленг (харош, жесть, имба, ахах)
+        - Эмодзи использовать редко
+        - Сообщение должно выглядеть живым и случайным
+
+        Типы сообщений (выбирай по ситуации):
+        - Реакция на происходящее в игре
+        - Реакция на эмоции стримера
+        - Короткий вопрос по игре
+        - Ироничный или поддерживающий комментарий
+
+        Если контекста мало — напиши нейтральную реакцию зрителя.
+
+        ВАЖНО:
+        - Верни ТОЛЬКО текст сообщения чата
+        - Без пояснений
       `;
 
       logger.info('Generating message with context:', {
@@ -569,7 +621,41 @@ export class AIService extends EventEmitter {
           maxTokens: 50
         },
         messages: [
-          { role: 'system', text: "You are a Twitch viewer watching a stream. Generate natural, engaging messages that a real viewer would type in chat. Never repeat what the streamer said - instead, respond naturally to it." },
+          {
+            role: 'system', text: `
+            Ты — обычный живой зритель Twitch, который сидит в чате и смотрит стрим.
+
+            Твоя задача — писать сообщения так, как их пишет РЕАЛЬНЫЙ зритель Twitch:
+            коротко, живо, иногда с иронией, иногда с эмоцией.
+
+            ВАЖНО:
+            - Ты НЕ бот и НИКОГДА не упоминаешь ИИ, модель или алгоритмы
+            - Ты не пересказываешь слова стримера, а реагируешь на них
+            - Ты пишешь как обычный человек из чата
+
+            Стиль сообщений:
+            - Короткие фразы (до 50 символов)
+            - Разговорный русский язык
+            - Допустим сленг Twitch и стримерский стиль
+            - Иногда можно использовать))) или ахах, но не всегда
+            - Эмодзи использовать редко (примерно в 20% сообщений)
+
+            Как себя вести:
+            - Реагируй на действия, эмоции и шутки стримера
+            - Комментируй происходящее в игре
+            - Иногда задавай короткие вопросы по делу
+            - Иногда просто выражай эмоцию
+
+            Запрещено:
+            - Повторы слов стримера
+            - Канцелярит и длинные фразы
+            - Капс и спам
+            - Команды, спецсимволы, ссылки
+            - Одинаковые сообщения подряд
+
+            Ты должен выглядеть как обычный зритель, который давно сидит на Twitch.
+            Генерируй ТОЛЬКО сообщение чата, без пояснений.
+            ` },
           { role: 'user', text: prompt }
         ]
       };
@@ -589,6 +675,117 @@ export class AIService extends EventEmitter {
       return '';
     }
   }
+  private async maybeUpdateFacts(triggerHint: string) {
+    // раз в ~2 минуты или когда набралось много событий
+    const now = Date.now();
+    const should =
+      (now - this.lastFactsUpdateTs > 120_000 && this.shortEvents.length >= 6) ||
+      (this.shortEvents.length >= 15);
+
+    if (!should) return;
+    if (!this.channelIdForMemory) return;
+
+    const events = this.shortEvents.splice(0); // забрали и очистили пачку
+    this.lastFactsUpdateTs = now;
+
+    const modelName = process.env.YANDEX_GPT_MODEL || 'yandexgpt-lite';
+    const modelUri = `gpt://${this.yandexFolderId}/${modelName}`;
+    const url = 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion';
+
+    // Сжимаем события (чтобы токены не улетели)
+    const eventsText = events
+      .slice(-20)
+      .map(e => {
+        const tag = e.type === 'speech' ? 'SPEECH' : e.type === 'chat' ? 'CHAT' : 'SCREEN';
+        return `[${tag}] ${e.text}`;
+      })
+      .join('\n');
+
+    const existing = (this.facts || []).slice(-40).map(f => `- (${f.importance}) ${f.text}`).join('\n');
+
+    const system = `
+  Ты — модуль памяти для Twitch-стрима.
+  Твоя задача: из новых событий извлечь КОРОТКИЕ факты, которые пригодятся для будущих реплик в чате.
+  Факт — это краткое утверждение на русском (1 строка), без домыслов и без “кажется”.
+  Если факт не подтверждён — не добавляй.
+  Учитывай контекст Twitch: шутки, прозвища, любимые темы, повторяющиеся ситуации, правила чата.
+
+  Выход СТРОГО в JSON без markdown:
+  {
+    "facts": [
+      {"text":"...", "importance":1-5, "tags":["...","..."]},
+      ...
+    ]
+  }
+
+  Ограничения:
+  - максимум 8 новых фактов за раз
+  - каждый факт до 120 символов
+  - не дублируй существующие факты по смыслу
+  `;
+
+    const user = `
+  СУЩЕСТВУЮЩИЕ ФАКТЫ:
+  ${existing || '(пока нет)'}
+
+  НОВЫЕ СОБЫТИЯ:
+  ${eventsText}
+
+  Подсказка-триггер (не факт): ${triggerHint}
+  `;
+
+    const body = {
+      modelUri,
+      completionOptions: { stream: false, temperature: 0.2, maxTokens: 350 },
+      messages: [
+        { role: 'system', text: system },
+        { role: 'user', text: user }
+      ]
+    };
+
+    try {
+      const r = await axios.post(url, body, {
+        headers: { Authorization: `Api-Key ${this.yandexApiKey}`, 'Content-Type': 'application/json' }
+      });
+
+      const raw = r.data?.result?.alternatives?.[0]?.message?.text?.trim?.() || '';
+      const parsed = JSON.parse(raw);
+      const newFacts = Array.isArray(parsed?.facts) ? parsed.facts : [];
+
+      const dedup = (t: string) => t.toLowerCase().replace(/\s+/g, ' ').trim();
+
+      const existingSet = new Set((this.facts || []).map(f => dedup(f.text)));
+
+      for (const nf of newFacts) {
+        const text = (nf?.text || '').toString().trim();
+        if (!text) continue;
+        const key = dedup(text);
+        if (existingSet.has(key)) continue;
+
+        this.facts.push({
+          id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+          text,
+          ts: Date.now(),
+          importance: Math.max(1, Math.min(5, Number(nf?.importance) || 2)),
+          tags: Array.isArray(nf?.tags) ? nf.tags.slice(0, 6) : []
+        });
+
+        existingSet.add(key);
+      }
+
+      // ограничим память по размеру
+      this.facts = this.facts
+        .sort((a, b) => (b.importance - a.importance) || (b.ts - a.ts))
+        .slice(0, 80);
+
+      await this.memoryStore.save({ channel: this.channelIdForMemory, updatedAt: Date.now(), facts: this.facts });
+
+      logger.info(`Memory updated: now ${this.facts.length} facts stored`);
+    } catch (e) {
+      logger.error('Failed to update memory facts:', e);
+    }
+  }
+
 
   private async getStreamUrl(channel: string): Promise<string> {
     try {
