@@ -10,202 +10,182 @@ interface BotConfig {
   shouldHandleVoiceCapture?: boolean;
 }
 
+function normalizeChannel(input: string): string {
+  let c = (input || '').trim();
+  if (c.includes('twitch.tv/')) {
+    c = (c.split('twitch.tv/')[1] || c).split('/')[0].split('?')[0];
+  }
+  if (c.startsWith('#')) c = c.slice(1);
+  return c.trim();
+}
+
 export class Bot {
-  private client: tmi.Client | null = null;
+  private client: tmi.Client;
   private aiService: AIService;
-  private lastMessageTime: number = 0;
-  private messageCount: number = 0;
-  private shouldHandleVoiceCapture: boolean;
-  private isConnected: boolean = false;
-  private reconnectAttempts: number = 0;
-  private readonly MAX_RECONNECT_ATTEMPTS = 5;
-  private readonly RECONNECT_DELAY = 5000;
+
+  private readonly channelName: string;
+  private isConnected = false;
+
+  private readonly minSendIntervalMs = parseInt(process.env.BOT_MIN_SEND_INTERVAL_MS || '90000', 10); // 90s
+  private readonly jitter = parseFloat(process.env.BOT_JITTER || '0.25'); // 25%
+  private lastSendTs = 0;
+
+  private sending = false;
+  private queue: string[] = [];
+
+  private pendingEcho:
+    | { msg: string; timeout: NodeJS.Timeout; resolve: () => void; reject: (e: Error) => void }
+    | null = null;
 
   constructor(config: BotConfig) {
     this.aiService = config.aiService;
-    this.shouldHandleVoiceCapture = config.shouldHandleVoiceCapture || false;
+    this.channelName = normalizeChannel(config.channel);
 
-    // Validate OAuth token format
     if (!config.oauth.startsWith('oauth:')) {
-      throw new Error(`Invalid OAuth token format for bot ${config.username}. Token must start with 'oauth:'`);
+      throw new Error(`Invalid OAuth token format. Must start with oauth:`);
     }
 
     this.client = new tmi.Client({
-      options: {
-        debug: false, // Disable debug in production
-        messagesLogLevel: "info"
-      },
-      identity: {
-        username: config.username,
-        password: config.oauth
-      },
-      channels: [config.channel],
-      connection: {
-        reconnect: true,
-        maxReconnectAttempts: this.MAX_RECONNECT_ATTEMPTS,
-        maxReconnectInterval: 30000,
-        secure: true
-      }
+      options: { debug: false, messagesLogLevel: 'info' },
+      identity: { username: config.username, password: config.oauth },
+      channels: [this.channelName],
+      connection: { reconnect: true, secure: true }
     });
 
-    this.setupEventHandlers();
+    this.setupHandlers();
 
-    // Setup voice capture only if this bot should handle it
-    if (this.shouldHandleVoiceCapture) {
-      this.setupVoiceCapture(config.channel).catch(error => {
-        logger.error(`Error setting up voice capture for bot ${config.username}:`, error);
-      });
+    if (config.shouldHandleVoiceCapture) {
+      this.aiService.startVoiceCapture(this.channelName).catch(err => logger.error('Voice capture error:', err));
     }
   }
 
-  private setupEventHandlers(): void {
-    if (!this.client) return;
+  private setupHandlers(): void {
+    this.client.on('message', (channel, tags, message, self) => {
+      if (self) {
+        if (this.pendingEcho && message === this.pendingEcho.msg) {
+          clearTimeout(this.pendingEcho.timeout);
+          this.pendingEcho.resolve();
+          this.pendingEcho = null;
+        }
+        return;
+      }
 
-    this.client.on('message', async (channel: string, tags: tmi.ChatUserstate, message: string, self: boolean) => {
-      if (self) return;
-
+      // ВАЖНО: передаём в AIService только username + текст
+      // (AIService сам это пишет в shortEvents для контекста)
       try {
-        // Create a rich context for message generation
-        const context = {
-          streamInfo: this.aiService.currentChannelInfo,
-          chatMessage: message,
+        this.aiService.emit('chatMessage', JSON.stringify({
           username: tags['display-name'] || tags.username,
-          timeSinceLastMessage: Date.now() - this.lastMessageTime,
-          messageCount: this.messageCount,
-          isChatMessage: true,
-          fullContext: {
-            currentGame: this.aiService.currentChannelInfo?.gameName,
-            streamTitle: this.aiService.currentChannelInfo?.title,
-            viewerCount: this.aiService.currentChannelInfo?.viewerCount
-          }
-        };
-
-        // Occasionally respond to other messages
-        if (Math.random() < 1.0) {
-          this.aiService.emit('chatMessage', JSON.stringify(context));
-        }
-      } catch (error) {
-        logger.error(`Error handling message for bot ${this.client?.getUsername()}:`, error);
+          chatMessage: message
+        }));
+      } catch (e) {
+        logger.error('chatMessage emit failed:', e);
       }
     });
 
-    this.client.on('connected', (address: string, port: number) => {
+    this.client.on('connected', (addr, port) => {
       this.isConnected = true;
-      this.reconnectAttempts = 0;
-      logger.info(`Bot ${this.client?.getUsername()} connected to chat at ${address}:${port}`);
+      logger.info(`Bot connected to ${addr}:${port}`);
     });
 
-    this.client.on('disconnected', (reason: string) => {
+    this.client.on('disconnected', (reason) => {
       this.isConnected = false;
-      logger.warn(`Bot ${this.client?.getUsername()} disconnected: ${reason}`);
+      logger.warn(`Bot disconnected: ${reason}`);
+
+      if (this.pendingEcho) {
+        clearTimeout(this.pendingEcho.timeout);
+        this.pendingEcho.reject(new Error('Disconnected before echo'));
+        this.pendingEcho = null;
+      }
+
+      this.sending = false;
     });
 
-    this.client.on('reconnect', () => {
-      this.reconnectAttempts++;
-      logger.info(`Bot ${this.client?.getUsername()} attempting to reconnect (attempt ${this.reconnectAttempts}/${this.MAX_RECONNECT_ATTEMPTS})`);
+    this.client.on('join', (channel, username, self) => {
+      if (self) logger.info(`Joined ${channel} as ${username}`);
     });
 
-    this.client.on('logon', () => {
-      logger.info(`Bot ${this.client?.getUsername()} successfully logged in`);
-    });
+    // AI → очередь
+    this.aiService.on('message', (msg: string) => {
+      const m = (msg || '').trim();
+      if (!m) return;
 
-    // Listen for messages from AI service
-    this.aiService.on('message', (message: string) => {
-      if (message && message.trim() !== '') {
+      // защита от дублей подряд
+      const last = this.queue.length ? this.queue[this.queue.length - 1] : '';
+      if (m === last) return;
+
+      this.queue.push(m);
+      this.flushQueue().catch(e => logger.error('flushQueue error:', e));
+    });
+  }
+
+  private calcMinIntervalWithJitter(): number {
+    const base = this.minSendIntervalMs;
+    const j = this.jitter;
+    return Math.floor(base * ((1 - j) + Math.random() * (2 * j)));
+  }
+
+  private async flushQueue(): Promise<void> {
+    if (this.sending) return;
+    this.sending = true;
+
+    try {
+      while (this.queue.length) {
+        if (!this.isConnected) return;
+
         const now = Date.now();
-        // Only send message if enough time has passed since last message
-        if (now - this.lastMessageTime >= 5000) { // 5 seconds minimum between messages
-          logger.info('Sending message:', message);
-          this.sendMessage(message).catch(error => {
-            logger.error(`Error sending message from ${this.client?.getUsername()}:`, error);
-          });
-          this.messageCount++;
-          this.lastMessageTime = now;
-        } else {
-          logger.info('Skipping message - too soon since last message');
-        }
+        const minGap = this.calcMinIntervalWithJitter();
+        const wait = this.lastSendTs ? Math.max(0, minGap - (now - this.lastSendTs)) : 0;
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+
+        const message = this.queue.shift()!;
+        await this.safeSend(message);
+        this.lastSendTs = Date.now();
       }
+    } finally {
+      this.sending = false;
+    }
+  }
+
+  private async safeSend(message: string): Promise<void> {
+    if (!this.isConnected) return;
+
+    const chan = `#${this.channelName}`;
+
+    const echoPromise = new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingEcho = null;
+        reject(new Error('No echo received'));
+      }, 4000);
+      this.pendingEcho = { msg: message, timeout, resolve, reject };
     });
-  }
 
-  private async setupVoiceCapture(channel: string): Promise<void> {
-    logger.info(`Setting up voice capture for channel: ${channel}`);
-    if (this.aiService.isVoiceCaptureActive) return;
     try {
-      // Start voice capture first, which will fetch channel info
-      await this.aiService.startVoiceCapture(channel);
-
-      // Wait for channel info to be available
-      let attempts = 0;
-      const maxAttempts = 5;
-      while (!this.aiService.currentChannelInfo && attempts < maxAttempts) {
-        logger.info('Waiting for channel info...');
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        attempts++;
+      await this.client.say(chan, message);
+      logger.info(`say() -> ${chan}: ${message}`);
+    } catch (e) {
+      if (this.pendingEcho) {
+        clearTimeout(this.pendingEcho.timeout);
+        this.pendingEcho = null;
       }
-
-      if (!this.aiService.currentChannelInfo) {
-        throw new Error('Failed to get channel info after multiple attempts');
-      }
-
-      logger.info('Channel info available:', {
-        title: this.aiService.currentChannelInfo.title,
-        game: this.aiService.currentChannelInfo.gameName,
-        viewers: this.aiService.currentChannelInfo.viewerCount
-      });
-    } catch (error) {
-      logger.error('Error setting up voice capture:', error);
-      throw error;
+      throw e;
     }
-  }
-
-  private async sendMessage(message: string): Promise<void> {
-    if (!this.client || !message) return;
 
     try {
-      // Extract channel name from URL if it's a full URL
-      const channelUrl = process.env.TWITCH_CHANNEL!;
-      const channelName = channelUrl.includes('twitch.tv/')
-        ? channelUrl.split('twitch.tv/')[1].split('/')[0].split('?')[0]
-        : channelUrl;
-
-      await this.client.say(`#${channelName}`, message);
-    } catch (error) {
-      logger.error(`Error sending message from ${this.client?.getUsername()}:`, error);
-      throw error;
-    }
-  }
-
-  private cleanupVoiceCapture(): void {
-    try {
-      this.aiService.stopVoiceCapture();
-    } catch (error) {
-      logger.error(`Error cleaning up voice capture for bot ${this.client?.getUsername()}:`, error);
+      await echoPromise;
+      logger.info(`Echo confirmed: ${message}`);
+    } catch (e) {
+      logger.warn(`Send not confirmed: ${(e as Error).message}`);
     }
   }
 
   public connect(): void {
-    if (!this.client) return;
-
-    logger.info(`Connecting bot ${this.client.getUsername()}...`);
-    this.client.connect().catch((error: Error) => {
-      logger.error(`Failed to connect bot ${this.client?.getUsername()}:`, error);
-    });
+    logger.info(`Connecting bot... (channel=${this.channelName})`);
+    this.client.connect().catch(e => logger.error('connect error:', e));
   }
 
   public disconnect(): void {
-    if (!this.client) return;
-
-    logger.info(`Disconnecting bot ${this.client.getUsername()}...`);
-    try {
-      this.client.disconnect();
-      this.cleanupVoiceCapture();
-    } catch (error) {
-      logger.error(`Error disconnecting bot ${this.client.getUsername()}:`, error);
-    }
+    logger.info('Disconnecting bot...');
+    this.client.disconnect();
+    this.aiService.stopVoiceCapture();
   }
-
-  public isBotConnected(): boolean {
-    return this.isConnected;
-  }
-} 
+}
